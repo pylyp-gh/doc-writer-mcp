@@ -6,7 +6,7 @@ author: Pylyp
 email: pylyp@ash.ph
 secrets:
     local:
-        enabled: false
+        enabled: true
         provider: env
         file: .env.local
     production:

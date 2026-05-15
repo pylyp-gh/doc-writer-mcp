@@ -40,7 +40,13 @@ func run() error {
 		log.Printf("MCP server listening at %s", *httpAddr)
 		return http.ListenAndServe(*httpAddr, handler)
 	} else {
-		t := mcp.NewLoggingTransport(mcp.NewStdioTransport(), os.Stderr)
+		// v1.6.0: NewStdioTransport / NewLoggingTransport functions removed —
+		// transports are now plain structs with public fields, initialized
+		// via composite literal.
+		t := &mcp.LoggingTransport{
+			Transport: &mcp.StdioTransport{},
+			Writer:    os.Stderr,
+		}
 		return server.Run(context.Background(), t)
 	}
 }

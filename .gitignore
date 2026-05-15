@@ -36,3 +36,7 @@ docker-compose.yml
 
 # MCP Inspector config
 mcp-server-config.json
+
+# Local secrets / env overrides (kmcp.yaml secrets.local.file)
+.env.local
+.env.*.local
