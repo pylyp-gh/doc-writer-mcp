@@ -1,0 +1,23 @@
+name: doc-writer-mcp
+framework: mcp-go
+version: 0.1.0
+description: Docementation writer MCP
+author: Pylyp
+email: pylyp@ash.ph
+secrets:
+    local:
+        enabled: false
+        provider: env
+        file: .env.local
+    production:
+        enabled: false
+        provider: kubernetes
+        secretName: doc-writer-mcp-secrets-production
+        namespace: default
+    staging:
+        enabled: false
+        provider: kubernetes
+        secretName: doc-writer-mcp-secrets-staging
+        namespace: default
+created_at: 2026-05-15T11:25:08.678037+01:00
+updated_at: 2026-05-15T11:25:17.326167+01:00
