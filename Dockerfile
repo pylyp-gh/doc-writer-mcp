@@ -1,5 +1,5 @@
 # Build stage
-FROM golang:1.23.0-alpine AS builder
+FROM golang:1.25-alpine AS builder
 
 WORKDIR /app
 
@@ -19,4 +19,5 @@ COPY --from=builder /app/server /app/server
 
 EXPOSE 8080
 
-ENTRYPOINT ["/app/server"] 
+ENTRYPOINT ["/app/server"]
+CMD ["--http", ":8080"] 
