@@ -94,6 +94,17 @@ var (
 	enableSampling          = envBoolOr("ENABLE_SAMPLING", true)
 	samplingMaxTokVerdict   = int64(envIntOr("SAMPLING_MAX_TOK_VERDICT", 100))
 	samplingMaxTokMetadata  = int64(envIntOr("SAMPLING_MAX_TOK_METADATA", 500))
+
+	// Elicitation (collection bootstrap + duplicate handling). Some MCP clients
+	// (e.g., kagent agent runtime) don't declare the elicitation capability —
+	// calling ss.Elicit on them errors out. Pattern matches the Sampling flag:
+	//   - true  + client supports → interactive Elicit (Inspector UX)
+	//   - true  + client lacks    → hard error (forces operator awareness)
+	//   - false + any client      → use sane defaults without asking
+	// Sane defaults when disabled:
+	//   - Missing collection → auto-create (operational, not content-level)
+	//   - Cosine duplicate   → decline (safest — never silently overwrite)
+	enableElicitation = envBoolOr("ENABLE_ELICITATION", true)
 )
 
 // Pre-compiled regex for cheap baseline injection detection.
@@ -210,7 +221,7 @@ func handleAddDocument(
 
 	// --- STEP 1.5: Elicit bootstrap if missing
 	if !exists {
-		approved, err := elicitBootstrap(ctx, req.Session)
+		approved, err := elicitBootstrap(ctx, req)
 		if err != nil {
 			return nil, AddDocumentResult{}, fmt.Errorf("elicit bootstrap failed: %w", err)
 		}
@@ -284,7 +295,7 @@ func handleAddDocument(
 
 	// --- STEP 4.5: Elicit dup-handling if a cosine match was found
 	if dup != nil {
-		choice, err := elicitDupAction(ctx, req.Session, dup)
+		choice, err := elicitDupAction(ctx, req, dup)
 		if err != nil {
 			return nil, AddDocumentResult{}, fmt.Errorf("elicit dup action failed: %w", err)
 		}
@@ -355,8 +366,17 @@ func handleAddDocument(
 // Elicitation helpers — wrap ServerSession.Elicit (go-sdk v1.6.0).
 // ============================================================================
 
-func elicitBootstrap(ctx context.Context, ss *mcp.ServerSession) (bool, error) {
-	resp, err := ss.Elicit(ctx, &mcp.ElicitParams{
+func elicitBootstrap(ctx context.Context, req *mcp.CallToolRequest) (bool, error) {
+	// Capability + flag gating. If interactive Elicit not viable, fall back
+	// to auto-bootstrap — creating an empty Qdrant collection is operational
+	// (no content risk), so it's safe to default to "yes" without asking.
+	if !enableElicitation || !elicitationSupported(req) {
+		fmt.Fprintf(os.Stderr,
+			"[elicitBootstrap] elicitation disabled or unsupported by client — auto-creating collection %q\n",
+			qdrantCollection)
+		return true, nil
+	}
+	resp, err := req.Session.Elicit(ctx, &mcp.ElicitParams{
 		Message: fmt.Sprintf(
 			"Collection '%s' doesn't exist. Create it with %d-dimension Cosine vectors?",
 			qdrantCollection, vectorDim,
@@ -383,8 +403,19 @@ func elicitBootstrap(ctx context.Context, ss *mcp.ServerSession) (bool, error) {
 	return create, nil
 }
 
-func elicitDupAction(ctx context.Context, ss *mcp.ServerSession, dup *dupHit) (string, error) {
-	resp, err := ss.Elicit(ctx, &mcp.ElicitParams{
+func elicitDupAction(ctx context.Context, req *mcp.CallToolRequest, dup *dupHit) (string, error) {
+	// Capability + flag gating. Without interactive Elicit, default to
+	// "decline" — safest choice. Auto-replace would risk silent data loss;
+	// auto-add_anyway would risk explosion of near-duplicate variants.
+	// Decline returns control to the agent, which can surface the dup to
+	// the user and let them re-submit explicitly.
+	if !enableElicitation || !elicitationSupported(req) {
+		fmt.Fprintf(os.Stderr,
+			"[elicitDupAction] elicitation disabled or unsupported — auto-declining dup of point %s (score=%.3f)\n",
+			dup.ID, dup.Score)
+		return "decline", nil
+	}
+	resp, err := req.Session.Elicit(ctx, &mcp.ElicitParams{
 		Message: fmt.Sprintf(
 			"Similar document found (cosine score=%.3f):\n%s\n\nHow to handle?",
 			dup.Score, previewFromPayload(dup.Payload),
@@ -449,6 +480,17 @@ type qualityMetadata struct {
 func samplingSupported(req *mcp.CallToolRequest) bool {
 	p := req.Session.InitializeParams()
 	if p == nil || p.Capabilities == nil || p.Capabilities.Sampling == nil {
+		return false
+	}
+	return true
+}
+
+// elicitationSupported — same capability gate, this time for ss.Elicit.
+// MCP Inspector declares both; kagent agent runtime declares neither.
+// Server uses this to decide between interactive Elicit and silent defaults.
+func elicitationSupported(req *mcp.CallToolRequest) bool {
+	p := req.Session.InitializeParams()
+	if p == nil || p.Capabilities == nil || p.Capabilities.Elicitation == nil {
 		return false
 	}
 	return true
