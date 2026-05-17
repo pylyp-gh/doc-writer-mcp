@@ -66,13 +66,38 @@ var (
 	maxTextLength   = envIntOr("MAX_TEXT_LENGTH", 32768)
 	minUniqueTokens = 3
 	maxRepeatRatio  = 0.6 // single token freq / total tokens — anything higher = repetitive garbage
+
+	// Language gating: percentage of letters that may belong to scripts other
+	// than Latin (English) or Cyrillic (Ukrainian/etc.). Default 5% tolerates
+	// occasional math symbols (Greek) or brand names while rejecting docs
+	// dominated by other scripts (CJK, Arabic, Thai, ...). Shrinks the
+	// prompt-injection attack surface by forcing payloads into two languages
+	// we can prompt-tune the LLM gate against.
+	maxForeignLettersPct = envIntOr("MAX_FOREIGN_LETTERS_PCT", 5)
 )
 
 // Pre-compiled regex for cheap baseline injection detection.
-// NOT bulletproof — semantic prompt injection ("ignore previous instructions")
-// is handled later by the LLM quality gate (Sampling, Layer 2).
-// Catches obvious XSS-style HTML payloads before they hit the embed call.
-var injectionRegex = regexp.MustCompile(`(?i)(<script[\s>/]|javascript:|on\w+\s*=\s*["']|<iframe[\s>])`)
+// Two attack classes covered:
+//  1. XSS / HTML payloads — keep the vector DB clean of obviously hostile
+//     markup that downstream renderers might execute.
+//  2. PROMPT INJECTION signatures — common English phrasings used by
+//     adversarial inputs to subvert an LLM that reads this doc later
+//     ("ignore previous instructions", "you are now ...", etc.).
+//
+// NOT bulletproof — easily bypassed via paraphrasing, Unicode obfuscation,
+// or non-English wording. That residual surface is what the L5 LLM gate
+// (Sampling) catches. This regex is the Pareto cheap-catch for script-kiddie
+// attempts at near-zero cost.
+var injectionRegex = regexp.MustCompile(`(?i)(` +
+	`<script[\s>/]|javascript:|on\w+\s*=\s*["']|<iframe[\s>]|` +
+	`\bignore\s+(all\s+|the\s+)?(previous|above|prior)\s+\w{0,12}\s*instructions?\b|` +
+	`\bdisregard\s+(all\s+|the\s+|previous\s+)?\w{0,12}\s*instructions?\b|` +
+	`\bforget\s+(all\s+|the\s+|previous\s+)?\w{0,12}\s*instructions?\b|` +
+	`\boverride\s+(all\s+|the\s+|previous\s+)?\w{0,12}\s*instructions?\b|` +
+	`\byou\s+are\s+now\s+\w+|` +
+	`\bsystem\s+prompt\s*[:=]|` +
+	`\brespond\s+(only\s+)?with\s+["']` +
+	`)`)
 
 // Known placeholder/pangram substrings (lowercased, substring match).
 // One false-negative is fine; the L5 LLM gate catches the rest. False-positives
@@ -599,6 +624,14 @@ func sanityCheckL0(text, sourceURL string) error {
 func sanityCheckL1(text string) error {
 	lower := strings.ToLower(text)
 
+	// Language gate — restrict to Latin/Cyrillic letters. Tightens the
+	// prompt-injection surface (LLM gate later is prompt-tuned for en+uk only).
+	// Cheap rune-walk; runs before regex/blacklist since rejecting whole
+	// foreign-script docs short-circuits any further analysis.
+	if err := languageGate(text); err != nil {
+		return err
+	}
+
 	// Placeholder/pangram substring match — short list of unambiguous patterns.
 	for _, pat := range placeholderBlacklist {
 		if strings.Contains(lower, pat) {
@@ -606,11 +639,12 @@ func sanityCheckL1(text string) error {
 		}
 	}
 
-	// HTML/script injection baseline. NOT a security boundary — just keeps the
-	// vector DB clean of obvious XSS payloads. Real prompt-injection detection
-	// lives in the LLM quality gate (Sampling, future commit).
+	// HTML/script + prompt-injection signature baseline. Catches XSS-style
+	// payloads AND common English injection phrasings ("ignore previous
+	// instructions", "you are now ...", etc.). Bypassable via paraphrasing
+	// or non-English wording — those cases are the job of the L5 LLM gate.
 	if injectionRegex.MatchString(text) {
-		return fmt.Errorf("text contains suspicious HTML/script patterns")
+		return fmt.Errorf("text contains suspicious HTML/script or prompt-injection patterns")
 	}
 
 	tokens := tokenize(lower)
@@ -655,6 +689,39 @@ func tokenize(s string) []string {
 	return strings.FieldsFunc(s, func(r rune) bool {
 		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
 	})
+}
+
+// languageGate — restricts allowed letter scripts to Latin and Cyrillic.
+// Counts LETTERS only (numbers, punctuation, whitespace, symbols, emoji are
+// neutral). Allows up to maxForeignLettersPct of foreign-script letters to
+// tolerate occasional Greek math symbols, brand names, transliterations.
+//
+// Why script-based and not language-based detection:
+//   - Script check is deterministic and O(N) — no model, no allocation.
+//   - Real language detection (CLD3, fastText) needs a model file + binding
+//     and gives probabilistic output. Overkill for a pre-filter.
+//   - Attackers can't trivially hide injection inside Latin/Cyrillic anyway;
+//     foreign-script injection is the surface we're shrinking here.
+func languageGate(text string) error {
+	var total, foreign int
+	for _, r := range text {
+		if !unicode.IsLetter(r) {
+			continue
+		}
+		total++
+		if !unicode.Is(unicode.Latin, r) && !unicode.Is(unicode.Cyrillic, r) {
+			foreign++
+		}
+	}
+	if total == 0 {
+		return nil // pure symbols/punctuation/emoji — let other L1 checks decide
+	}
+	pct := foreign * 100 / total
+	if pct > maxForeignLettersPct {
+		return fmt.Errorf("text has %d%% non-Latin/Cyrillic letters (max %d%%) — only English and Ukrainian content is accepted",
+			pct, maxForeignLettersPct)
+	}
+	return nil
 }
 
 // ============================================================================
