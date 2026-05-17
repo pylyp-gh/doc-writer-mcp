@@ -8,8 +8,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"os"
+	"regexp"
+	"strconv"
+	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -35,6 +41,15 @@ func envOr(key, def string) string {
 	return def
 }
 
+func envIntOr(key string, def int) int {
+	if v := os.Getenv(key); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
 var (
 	ollamaURL        = envOr("OLLAMA_URL", "http://ollama.agentgateway-system.svc.cluster.local:11434/v1")
 	ollamaModel      = envOr("OLLAMA_MODEL", "nomic-embed-text")
@@ -42,7 +57,32 @@ var (
 	qdrantCollection = envOr("QDRANT_COLLECTION", "doc-writer")
 	vectorDim        = 768  // matches nomic-embed-text dimension
 	dupThreshold     = 0.95 // cosine similarity — paraphrase-tolerant duplicate detection
+
+	// Sanity check thresholds — env-overridable so operators can tune without
+	// recompiling. Defaults chosen for typical documentation chunks: ≥50 chars
+	// (~8-10 words) and ≤32 KB (Qdrant payload stays manageable; larger texts
+	// should be chunked upstream before reaching the writer).
+	minTextLength   = envIntOr("MIN_TEXT_LENGTH", 50)
+	maxTextLength   = envIntOr("MAX_TEXT_LENGTH", 32768)
+	minUniqueTokens = 3
+	maxRepeatRatio  = 0.6 // single token freq / total tokens — anything higher = repetitive garbage
 )
+
+// Pre-compiled regex for cheap baseline injection detection.
+// NOT bulletproof — semantic prompt injection ("ignore previous instructions")
+// is handled later by the LLM quality gate (Sampling, Layer 2).
+// Catches obvious XSS-style HTML payloads before they hit the embed call.
+var injectionRegex = regexp.MustCompile(`(?i)(<script[\s>/]|javascript:|on\w+\s*=\s*["']|<iframe[\s>])`)
+
+// Known placeholder/pangram substrings (lowercased, substring match).
+// One false-negative is fine; the L5 LLM gate catches the rest. False-positives
+// here matter more — keep the list short and unambiguous.
+var placeholderBlacklist = []string{
+	"the quick brown fox",
+	"lorem ipsum",
+	"тест тест тест",
+	"foo bar baz",
+}
 
 // Single package-level http.Client — TCP connection reuse, avoid per-call thrash.
 var httpClient = &http.Client{Timeout: 30 * time.Second}
@@ -98,24 +138,32 @@ func handleAddDocument(
 	text := params.Text
 	sourceURL := params.SourceURL
 
-	// --- Guard: empty text — soft error so the agent can re-prompt the user
-	if text == "" {
-		return softErr("text parameter is required and cannot be empty")
+	// --- STEP 0: L0 sanity — structural validation (empty, length, UTF-8, URL).
+	// Cheap, deterministic; ~µs cost. Fail fast before any network call.
+	if err := sanityCheckL0(text, sourceURL); err != nil {
+		return softErr("L0 sanity check failed: " + err.Error())
 	}
 
-	// --- STEP 1: Embed text via Ollama (OpenAI-compatible embeddings endpoint)
-	vector, err := embedText(ctx, text)
-	if err != nil {
-		return nil, AddDocumentResult{}, fmt.Errorf("embed failed: %w", err)
+	// --- STEP 0.5: L1 sanity — lexical heuristics (token diversity, repetition,
+	// HTML/script injection patterns, placeholder blacklist). Still cheap, no network.
+	if err := sanityCheckL1(text); err != nil {
+		return softErr("L1 sanity check failed: " + err.Error())
 	}
 
-	// --- STEP 2: Check collection existence
+	// Hash on TRIMMED text — so "foo" and "  foo  " collide on exact-dup check.
+	// Computed once, reused for L2 lookup AND final payload storage.
+	trimmed := strings.TrimSpace(text)
+	h := sha256.Sum256([]byte(trimmed))
+	hashHex := hex.EncodeToString(h[:])
+
+	// --- STEP 1: Check collection existence (moved BEFORE embed so we can run
+	// L2 hash dedup against an existing collection and skip the embed cost).
 	exists, err := checkCollection(ctx)
 	if err != nil {
 		return nil, AddDocumentResult{}, fmt.Errorf("collection check failed: %w", err)
 	}
 
-	// --- STEP 2.5: Elicit bootstrap if missing
+	// --- STEP 1.5: Elicit bootstrap if missing
 	if !exists {
 		approved, err := elicitBootstrap(ctx, req.Session)
 		if err != nil {
@@ -134,7 +182,28 @@ func handleAddDocument(
 		}
 	}
 
-	// --- STEP 3: Duplicate detection — cosine similarity search
+	// --- STEP 2: L2 sanity — SHA-256 dedup BEFORE expensive embed.
+	// Skip lookup when we just created the collection (it's empty by definition).
+	if exists {
+		hit, err := dedupByHashL2(ctx, hashHex)
+		if err != nil {
+			return nil, AddDocumentResult{}, fmt.Errorf("L2 hash lookup failed: %w", err)
+		}
+		if hit != nil {
+			return softErr(fmt.Sprintf(
+				"L2 dedup: exact-hash duplicate already exists as point %s. "+
+					"Skipping embed and upsert to save the round-trip.", hit.ID,
+			))
+		}
+	}
+
+	// --- STEP 3: Embed text via Ollama (OpenAI-compatible embeddings endpoint)
+	vector, err := embedText(ctx, text)
+	if err != nil {
+		return nil, AddDocumentResult{}, fmt.Errorf("embed failed: %w", err)
+	}
+
+	// --- STEP 4: Duplicate detection — cosine similarity search (paraphrase-aware)
 	dup, err := searchSimilar(ctx, vector)
 	if err != nil {
 		return nil, AddDocumentResult{}, fmt.Errorf("search failed: %w", err)
@@ -143,7 +212,7 @@ func handleAddDocument(
 	action := "inserted"
 	pointID := uuid.NewString()
 
-	// --- STEP 3.5: Elicit dup-handling if a match was found
+	// --- STEP 4.5: Elicit dup-handling if a cosine match was found
 	if dup != nil {
 		choice, err := elicitDupAction(ctx, req.Session, dup)
 		if err != nil {
@@ -167,12 +236,13 @@ func handleAddDocument(
 		}
 	}
 
-	// --- STEP 4: Build payload + upsert into Qdrant
-	hash := sha256.Sum256([]byte(text))
+	// --- STEP 5: Build payload + upsert into Qdrant.
+	// Reuse hashHex computed once at L2 stage; store original (non-trimmed) text
+	// in payload so retrieval sees the user's exact submission.
 	payload := map[string]any{
 		"text":      text,
 		"sourceUrl": sourceURL,
-		"hash":      hex.EncodeToString(hash[:]),
+		"hash":      hashHex,
 		"addedAt":   time.Now().UTC().Format(time.RFC3339),
 		"action":    action,
 	}
@@ -180,7 +250,7 @@ func handleAddDocument(
 		return nil, AddDocumentResult{}, fmt.Errorf("upsert failed: %w", err)
 	}
 
-	// --- STEP 5: Return success
+	// --- STEP 6: Return success
 	result := &mcp.CallToolResult{
 		Content: []mcp.Content{
 			&mcp.TextContent{
@@ -388,6 +458,66 @@ func searchSimilar(ctx context.Context, vector []float32) (*dupHit, error) {
 	return &out.Result[0], nil
 }
 
+// dedupByHashL2 — Qdrant scroll with payload filter `hash == hashHex`.
+// Returns the first matching point if any, nil if no exact-content duplicate.
+//
+// Why scroll and not search?
+//   - search() requires a query vector (cosine over embeddings).
+//   - scroll() walks the payload index and matches deterministically on the
+//     `hash` field. No embed needed → that's the whole point of L2: skip the
+//     200ms Ollama call when an exact byte-for-byte match already exists.
+//
+// For this to be O(log N), Qdrant needs a payload index on `hash`. With no
+// index it falls back to full scan — still fine for lab scale (≤10k points),
+// but worth knowing for production. Index creation:
+//
+//	PUT /collections/{name}/index {"field_name": "hash", "field_schema": "keyword"}
+func dedupByHashL2(ctx context.Context, hashHex string) (*dupHit, error) {
+	body, _ := json.Marshal(map[string]any{
+		"filter": map[string]any{
+			"must": []map[string]any{
+				{
+					"key":   "hash",
+					"match": map[string]any{"value": hashHex},
+				},
+			},
+		},
+		"limit":        1,
+		"with_payload": true,
+	})
+	req, _ := http.NewRequestWithContext(ctx, "POST",
+		qdrantURL+"/collections/"+qdrantCollection+"/points/scroll", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("qdrant scroll HTTP %d", resp.StatusCode)
+	}
+	var out struct {
+		Result struct {
+			Points []struct {
+				ID      any            `json:"id"`
+				Payload map[string]any `json:"payload"`
+			} `json:"points"`
+		} `json:"result"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		return nil, fmt.Errorf("decode qdrant scroll: %w", err)
+	}
+	if len(out.Result.Points) == 0 {
+		return nil, nil
+	}
+	p := out.Result.Points[0]
+	return &dupHit{
+		ID:      fmt.Sprintf("%v", p.ID),
+		Score:   1.0, // exact-hash match → cosine would also be 1.0
+		Payload: p.Payload,
+	}, nil
+}
+
 func upsertPoint(ctx context.Context, id string, vector []float32, payload map[string]any) error {
 	body, _ := json.Marshal(map[string]any{
 		"points": []map[string]any{
@@ -424,6 +554,107 @@ func deletePoint(ctx context.Context, id string) error {
 		return fmt.Errorf("qdrant delete HTTP %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// ============================================================================
+// Sanity check layers — L0 (structural) → L1 (lexical) → L2 (in dedupByHashL2).
+//
+// Layered defence: each layer is cheaper than the next, so we fail fast on the
+// cheap ones. Reject ratio at the cheap end multiplies time saved at the
+// expensive end (embed + Qdrant network).
+//
+//   L0: trim/length/UTF-8/URL parse        — µs, no allocation
+//   L1: tokenisation, regex, blacklist     — ms, in-process
+//   L2: SHA-256 + Qdrant scroll            — ~10ms, one round-trip
+//   L3+ (deferred): magnitude check, lang gating, LLM quality gate
+// ============================================================================
+
+func sanityCheckL0(text, sourceURL string) error {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return fmt.Errorf("text is empty or whitespace-only")
+	}
+	// Length: count runes (Unicode chars) for min, bytes for max.
+	// Min guards against unembeddable snippets; max guards against payload bloat.
+	runes := utf8.RuneCountInString(trimmed)
+	if runes < minTextLength {
+		return fmt.Errorf("text too short: %d chars (min %d)", runes, minTextLength)
+	}
+	if len(text) > maxTextLength {
+		return fmt.Errorf("text too large: %d bytes (max %d) — chunk it before storing",
+			len(text), maxTextLength)
+	}
+	if !utf8.ValidString(text) {
+		return fmt.Errorf("text contains invalid UTF-8 sequences")
+	}
+	if sourceURL != "" {
+		u, err := url.Parse(sourceURL)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return fmt.Errorf("sourceUrl is not a well-formed absolute URL: %q", sourceURL)
+		}
+	}
+	return nil
+}
+
+func sanityCheckL1(text string) error {
+	lower := strings.ToLower(text)
+
+	// Placeholder/pangram substring match — short list of unambiguous patterns.
+	for _, pat := range placeholderBlacklist {
+		if strings.Contains(lower, pat) {
+			return fmt.Errorf("text matches known placeholder pattern: %q", pat)
+		}
+	}
+
+	// HTML/script injection baseline. NOT a security boundary — just keeps the
+	// vector DB clean of obvious XSS payloads. Real prompt-injection detection
+	// lives in the LLM quality gate (Sampling, future commit).
+	if injectionRegex.MatchString(text) {
+		return fmt.Errorf("text contains suspicious HTML/script patterns")
+	}
+
+	tokens := tokenize(lower)
+	if len(tokens) == 0 {
+		return fmt.Errorf("text has no extractable word tokens")
+	}
+
+	// Unique-token floor — anything with <3 distinct words is almost certainly
+	// noise ("test test test", "ok ok ok", single-word inputs after split).
+	freq := make(map[string]int, len(tokens))
+	for _, t := range tokens {
+		freq[t]++
+	}
+	if len(freq) < minUniqueTokens {
+		return fmt.Errorf("text has only %d unique token(s) (min %d) — likely placeholder",
+			len(freq), minUniqueTokens)
+	}
+
+	// Repetition ratio: most frequent token / total tokens. Catches "тест тест тест"
+	// (ratio 1.0). A 60% ceiling tolerates legitimate prose where stop-words repeat
+	// but reject pure-repetition garbage.
+	maxFreq := 0
+	for _, c := range freq {
+		if c > maxFreq {
+			maxFreq = c
+		}
+	}
+	ratio := float64(maxFreq) / float64(len(tokens))
+	if ratio > maxRepeatRatio {
+		return fmt.Errorf("text is %.0f%% repetition of a single token — looks like garbage",
+			ratio*100)
+	}
+
+	return nil
+}
+
+// tokenize — splits on any rune that is not a letter or digit. Cyrillic and
+// Latin both flow through unicode.IsLetter; punctuation, whitespace, symbols
+// become delimiters. Pure-ASCII strings.Fields would miss punctuation glued
+// to words like "test.test.test" — FieldsFunc on category is robust.
+func tokenize(s string) []string {
+	return strings.FieldsFunc(s, func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r)
+	})
 }
 
 // ============================================================================
