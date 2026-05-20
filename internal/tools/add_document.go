@@ -218,7 +218,16 @@ func handleAddDocument(
 	{
 		_, span := tracer.Start(ctx, "validate.L0")
 		setKind(span, kindGuardrail)
+		span.SetAttributes(
+			attribute.String("input.value", fmt.Sprintf("text=%q sourceUrl=%q",
+				truncate(text, 200), sourceURL)),
+		)
 		l0err := sanityCheckL0(text, sourceURL)
+		if l0err != nil {
+			span.SetAttributes(attribute.String("output.value", "REJECT: "+l0err.Error()))
+		} else {
+			span.SetAttributes(attribute.String("output.value", "PASS"))
+		}
 		endSpanWithErr(span, l0err)
 		if l0err != nil {
 			return softErr("L0 sanity check failed: " + l0err.Error())
@@ -230,7 +239,13 @@ func handleAddDocument(
 	{
 		_, span := tracer.Start(ctx, "validate.L1")
 		setKind(span, kindGuardrail)
+		span.SetAttributes(attribute.String("input.value", truncate(text, 240)))
 		l1err := sanityCheckL1(text)
+		if l1err != nil {
+			span.SetAttributes(attribute.String("output.value", "REJECT: "+l1err.Error()))
+		} else {
+			span.SetAttributes(attribute.String("output.value", "PASS"))
+		}
 		endSpanWithErr(span, l1err)
 		if l1err != nil {
 			return softErr("L1 sanity check failed: " + l1err.Error())
@@ -252,8 +267,14 @@ func handleAddDocument(
 		),
 	)
 	setKind(checkSpan, kindRetriever)
+	checkSpan.SetAttributes(attribute.String("input.value",
+		fmt.Sprintf("collection=%q", qdrantCollection)))
 	exists, err := checkCollection(checkCtx)
-	checkSpan.SetAttributes(attribute.Bool("qdrant.collection.exists", exists))
+	checkSpan.SetAttributes(
+		attribute.Bool("qdrant.collection.exists", exists),
+		attribute.String("output.value",
+			fmt.Sprintf(`{"exists": %t}`, exists)),
+	)
 	endSpanWithErr(checkSpan, err)
 	if err != nil {
 		return nil, AddDocumentResult{}, fmt.Errorf("collection check failed: %w", err)
@@ -263,8 +284,14 @@ func handleAddDocument(
 	if !exists {
 		elicitCtx, elicitSpan := tracer.Start(ctx, "elicit.bootstrap")
 		setKind(elicitSpan, kindTool)
+		elicitSpan.SetAttributes(attribute.String("input.value",
+			fmt.Sprintf("missing collection %q — approve creation?", qdrantCollection)))
 		approved, err := elicitBootstrap(elicitCtx, req)
-		elicitSpan.SetAttributes(attribute.Bool("elicit.approved", approved))
+		elicitSpan.SetAttributes(
+			attribute.Bool("elicit.approved", approved),
+			attribute.String("output.value",
+				fmt.Sprintf(`{"approved": %t}`, approved)),
+		)
 		endSpanWithErr(elicitSpan, err)
 		if err != nil {
 			return nil, AddDocumentResult{}, fmt.Errorf("elicit bootstrap failed: %w", err)
@@ -284,7 +311,14 @@ func handleAddDocument(
 			),
 		)
 		setKind(createSpan, kindRetriever)
+		createSpan.SetAttributes(
+			attribute.String("input.value",
+				fmt.Sprintf(`{"collection": %q, "vectorSize": 768, "distance": "Cosine"}`, qdrantCollection)),
+		)
 		err = createCollection(createCtx)
+		if err == nil {
+			createSpan.SetAttributes(attribute.String("output.value", "created"))
+		}
 		endSpanWithErr(createSpan, err)
 		if err != nil {
 			return nil, AddDocumentResult{}, fmt.Errorf("collection create failed: %w", err)
@@ -301,8 +335,17 @@ func handleAddDocument(
 			),
 		)
 		setKind(dedupSpan, kindRetriever)
+		dedupSpan.SetAttributes(
+			attribute.String("input.value", fmt.Sprintf(`{"sha256": %q}`, hashHex)),
+		)
 		hit, err := dedupByHashL2(dedupCtx, hashHex)
 		dedupSpan.SetAttributes(attribute.Bool("dedup.hit", hit != nil))
+		if hit != nil {
+			dedupSpan.SetAttributes(attribute.String("output.value",
+				fmt.Sprintf(`{"hit": true, "id": %q}`, hit.ID)))
+		} else {
+			dedupSpan.SetAttributes(attribute.String("output.value", `{"hit": false}`))
+		}
 		endSpanWithErr(dedupSpan, err)
 		if err != nil {
 			return nil, AddDocumentResult{}, fmt.Errorf("L2 hash lookup failed: %w", err)
@@ -333,10 +376,15 @@ func handleAddDocument(
 			),
 		)
 		setKind(verdictSpan, kindLLM)
+		verdictSpan.SetAttributes(
+			attribute.String("input.value", truncate(text, 480)),
+		)
 		accepted, reason, err := sampleVerdict(verdictCtx, req.Session, text)
 		verdictSpan.SetAttributes(
 			attribute.Bool("sampling.accepted", accepted),
 			attribute.String("sampling.reason", reason),
+			attribute.String("output.value",
+				fmt.Sprintf(`{"accepted": %t, "reason": %q}`, accepted, reason)),
 		)
 		endSpanWithErr(verdictSpan, err)
 		if err != nil {
@@ -353,12 +401,18 @@ func handleAddDocument(
 			),
 		)
 		setKind(metaSpan, kindLLM)
+		metaSpan.SetAttributes(
+			attribute.String("input.value", truncate(text, 480)),
+		)
 		meta, err = sampleMetadata(metaCtx, req.Session, text)
 		if meta != nil {
 			metaSpan.SetAttributes(
 				attribute.String("doc.title", meta.Title),
 				attribute.Int("doc.tag_count", len(meta.Tags)),
 			)
+			if metaJSON, jerr := json.Marshal(meta); jerr == nil {
+				metaSpan.SetAttributes(attribute.String("output.value", string(metaJSON)))
+			}
 		}
 		endSpanWithErr(metaSpan, err)
 		if err != nil {
@@ -378,8 +432,15 @@ func handleAddDocument(
 		),
 	)
 	setKind(embedSpan, kindEmbedding)
+	embedSpan.SetAttributes(
+		attribute.String("input.value", truncate(text, 480)),
+	)
 	vector, err := embedText(embedCtx, text)
-	embedSpan.SetAttributes(attribute.Int("embedding.dimension", len(vector)))
+	embedSpan.SetAttributes(
+		attribute.Int("embedding.dimension", len(vector)),
+		attribute.String("output.value",
+			fmt.Sprintf(`{"dimension": %d}`, len(vector))),
+	)
 	endSpanWithErr(embedSpan, err)
 	if err != nil {
 		return nil, AddDocumentResult{}, fmt.Errorf("embed failed: %w", err)
@@ -393,10 +454,21 @@ func handleAddDocument(
 		),
 	)
 	setKind(searchSpan, kindRetriever)
+	searchSpan.SetAttributes(
+		attribute.String("input.value",
+			fmt.Sprintf(`{"vector_dim": %d, "threshold": %.2f}`,
+				len(vector), dupThreshold)),
+	)
 	dup, err := searchSimilar(searchCtx, vector)
 	searchSpan.SetAttributes(attribute.Bool("dedup.hit", dup != nil))
 	if dup != nil {
-		searchSpan.SetAttributes(attribute.Float64("dedup.score", float64(dup.Score)))
+		searchSpan.SetAttributes(
+			attribute.Float64("dedup.score", dup.Score),
+			attribute.String("output.value",
+				fmt.Sprintf(`{"hit": true, "id": %q, "score": %.4f}`, dup.ID, dup.Score)),
+		)
+	} else {
+		searchSpan.SetAttributes(attribute.String("output.value", `{"hit": false}`))
 	}
 	endSpanWithErr(searchSpan, err)
 	if err != nil {
@@ -410,8 +482,16 @@ func handleAddDocument(
 	if dup != nil {
 		dupElicitCtx, dupElicitSpan := tracer.Start(ctx, "elicit.dup_action")
 		setKind(dupElicitSpan, kindTool)
+		dupElicitSpan.SetAttributes(
+			attribute.String("input.value",
+				fmt.Sprintf(`{"matched_id": %q, "score": %.4f}`, dup.ID, dup.Score)),
+		)
 		choice, err := elicitDupAction(dupElicitCtx, req, dup)
-		dupElicitSpan.SetAttributes(attribute.String("elicit.choice", choice))
+		dupElicitSpan.SetAttributes(
+			attribute.String("elicit.choice", choice),
+			attribute.String("output.value",
+				fmt.Sprintf(`{"choice": %q}`, choice)),
+		)
 		endSpanWithErr(dupElicitSpan, err)
 		if err != nil {
 			return nil, AddDocumentResult{}, fmt.Errorf("elicit dup action failed: %w", err)
@@ -422,7 +502,13 @@ func handleAddDocument(
 		case "replace":
 			delCtx, delSpan := tracer.Start(ctx, "qdrant.delete_point")
 			setKind(delSpan, kindRetriever)
+			delSpan.SetAttributes(
+				attribute.String("input.value", fmt.Sprintf(`{"id": %q}`, dup.ID)),
+			)
 			err := deletePoint(delCtx, dup.ID)
+			if err == nil {
+				delSpan.SetAttributes(attribute.String("output.value", "deleted"))
+			}
 			endSpanWithErr(delSpan, err)
 			if err != nil {
 				return nil, AddDocumentResult{}, fmt.Errorf("delete old point: %w", err)
@@ -431,7 +517,13 @@ func handleAddDocument(
 		case "new_version":
 			delCtx, delSpan := tracer.Start(ctx, "qdrant.delete_point")
 			setKind(delSpan, kindRetriever)
+			delSpan.SetAttributes(
+				attribute.String("input.value", fmt.Sprintf(`{"id": %q}`, dup.ID)),
+			)
 			err := deletePoint(delCtx, dup.ID)
+			if err == nil {
+				delSpan.SetAttributes(attribute.String("output.value", "deleted"))
+			}
 			endSpanWithErr(delSpan, err)
 			if err != nil {
 				return nil, AddDocumentResult{}, fmt.Errorf("delete old point: %w", err)
@@ -475,7 +567,15 @@ func handleAddDocument(
 		),
 	)
 	setKind(upsertSpan, kindRetriever)
+	if payloadJSON, jerr := json.Marshal(payload); jerr == nil {
+		upsertSpan.SetAttributes(attribute.String("input.value",
+			truncate(string(payloadJSON), 480)))
+	}
 	err = upsertPoint(upsertCtx, pointID, vector, payload)
+	if err == nil {
+		upsertSpan.SetAttributes(attribute.String("output.value",
+			fmt.Sprintf(`{"id": %q, "action": %q}`, pointID, action)))
+	}
 	endSpanWithErr(upsertSpan, err)
 	if err != nil {
 		return nil, AddDocumentResult{}, fmt.Errorf("upsert failed: %w", err)
