@@ -10,7 +10,27 @@ import (
 
 	"github.com/pylyp-gh/doc-writer-mcp/internal/tools"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/propagation"
 )
+
+// extractTraceContext pulls traceparent + tracestate з incoming HTTP
+// headers into the request context. Lets upstream callers (sample_client,
+// agentgateway) stitch their spans з our tool-handler spans into one
+// trace tree.
+//
+// We deliberately do NOT use otelhttp.NewHandler here — it would also
+// emit a wide "POST /mcp" HTTP-level span per request, which we removed
+// earlier because session-teardown / healthcheck noise drowned the
+// semantic operation signal. This middleware only does the extraction
+// side, with zero spans of its own.
+func extractTraceContext(next http.Handler) http.Handler {
+	propagator := otel.GetTextMapPropagator()
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		ctx := propagator.Extract(r.Context(), propagation.HeaderCarrier(r.Header))
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
 
 var (
 	httpAddr = flag.String("http", "", "if set, use streamable HTTP to serve MCP (on this address), instead of stdin/stdout")
@@ -53,7 +73,7 @@ func run() error {
 			return server
 		}, nil)
 		log.Printf("MCP server listening at %s", *httpAddr)
-		return http.ListenAndServe(*httpAddr, handler)
+		return http.ListenAndServe(*httpAddr, extractTraceContext(handler))
 	} else {
 		// v1.6.0: NewStdioTransport / NewLoggingTransport functions removed —
 		// transports are now plain structs with public fields, initialized
