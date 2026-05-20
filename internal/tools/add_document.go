@@ -202,6 +202,12 @@ func handleAddDocument(
 			attribute.String("doc.source_url", params.SourceURL),
 		),
 	)
+	setKind(rootSpan, kindChain)
+	// input.value populates Phoenix's "Input" tab — keep compact (no full
+	// document text in the attribute, just a header). Phoenix attribute
+	// size limit ~32KB, but huge values bloat span exporter payloads.
+	rootSpan.SetAttributes(attribute.String("input.value",
+		truncate(params.Text, 240)))
 	defer rootSpan.End()
 
 	text := params.Text
@@ -211,6 +217,7 @@ func handleAddDocument(
 	// Cheap, deterministic; ~µs cost. Fail fast before any network call.
 	{
 		_, span := tracer.Start(ctx, "validate.L0")
+		setKind(span, kindGuardrail)
 		l0err := sanityCheckL0(text, sourceURL)
 		endSpanWithErr(span, l0err)
 		if l0err != nil {
@@ -222,6 +229,7 @@ func handleAddDocument(
 	// HTML/script injection patterns, placeholder blacklist). Still cheap, no network.
 	{
 		_, span := tracer.Start(ctx, "validate.L1")
+		setKind(span, kindGuardrail)
 		l1err := sanityCheckL1(text)
 		endSpanWithErr(span, l1err)
 		if l1err != nil {
@@ -243,6 +251,7 @@ func handleAddDocument(
 			attribute.String("db.collection.name", qdrantCollection),
 		),
 	)
+	setKind(checkSpan, kindRetriever)
 	exists, err := checkCollection(checkCtx)
 	checkSpan.SetAttributes(attribute.Bool("qdrant.collection.exists", exists))
 	endSpanWithErr(checkSpan, err)
@@ -253,6 +262,7 @@ func handleAddDocument(
 	// --- STEP 1.5: Elicit bootstrap if missing
 	if !exists {
 		elicitCtx, elicitSpan := tracer.Start(ctx, "elicit.bootstrap")
+		setKind(elicitSpan, kindTool)
 		approved, err := elicitBootstrap(elicitCtx, req)
 		elicitSpan.SetAttributes(attribute.Bool("elicit.approved", approved))
 		endSpanWithErr(elicitSpan, err)
@@ -273,6 +283,7 @@ func handleAddDocument(
 				attribute.String("db.collection.name", qdrantCollection),
 			),
 		)
+		setKind(createSpan, kindRetriever)
 		err = createCollection(createCtx)
 		endSpanWithErr(createSpan, err)
 		if err != nil {
@@ -289,6 +300,7 @@ func handleAddDocument(
 				attribute.String("hash.algorithm", "sha256"),
 			),
 		)
+		setKind(dedupSpan, kindRetriever)
 		hit, err := dedupByHashL2(dedupCtx, hashHex)
 		dedupSpan.SetAttributes(attribute.Bool("dedup.hit", hit != nil))
 		endSpanWithErr(dedupSpan, err)
@@ -320,6 +332,7 @@ func handleAddDocument(
 				attribute.String("gen_ai.operation.name", "verdict"),
 			),
 		)
+		setKind(verdictSpan, kindLLM)
 		accepted, reason, err := sampleVerdict(verdictCtx, req.Session, text)
 		verdictSpan.SetAttributes(
 			attribute.Bool("sampling.accepted", accepted),
@@ -339,6 +352,7 @@ func handleAddDocument(
 				attribute.String("gen_ai.operation.name", "extract_metadata"),
 			),
 		)
+		setKind(metaSpan, kindLLM)
 		meta, err = sampleMetadata(metaCtx, req.Session, text)
 		if meta != nil {
 			metaSpan.SetAttributes(
@@ -358,8 +372,12 @@ func handleAddDocument(
 			attribute.String("gen_ai.system", "ollama"),
 			attribute.String("gen_ai.operation.name", "embeddings"),
 			attribute.String("gen_ai.request.model", ollamaModel),
+			// OpenInference-specific: Phoenix's Embedding panel keys off
+			// embedding.model_name, не gen_ai.request.model.
+			attribute.String("embedding.model_name", ollamaModel),
 		),
 	)
+	setKind(embedSpan, kindEmbedding)
 	vector, err := embedText(embedCtx, text)
 	embedSpan.SetAttributes(attribute.Int("embedding.dimension", len(vector)))
 	endSpanWithErr(embedSpan, err)
@@ -374,6 +392,7 @@ func handleAddDocument(
 			attribute.String("db.operation", "search"),
 		),
 	)
+	setKind(searchSpan, kindRetriever)
 	dup, err := searchSimilar(searchCtx, vector)
 	searchSpan.SetAttributes(attribute.Bool("dedup.hit", dup != nil))
 	if dup != nil {
@@ -390,6 +409,7 @@ func handleAddDocument(
 	// --- STEP 4.5: Elicit dup-handling if a cosine match was found
 	if dup != nil {
 		dupElicitCtx, dupElicitSpan := tracer.Start(ctx, "elicit.dup_action")
+		setKind(dupElicitSpan, kindTool)
 		choice, err := elicitDupAction(dupElicitCtx, req, dup)
 		dupElicitSpan.SetAttributes(attribute.String("elicit.choice", choice))
 		endSpanWithErr(dupElicitSpan, err)
@@ -401,6 +421,7 @@ func handleAddDocument(
 			return softErr("Duplicate detected; user declined insertion.")
 		case "replace":
 			delCtx, delSpan := tracer.Start(ctx, "qdrant.delete_point")
+			setKind(delSpan, kindRetriever)
 			err := deletePoint(delCtx, dup.ID)
 			endSpanWithErr(delSpan, err)
 			if err != nil {
@@ -409,6 +430,7 @@ func handleAddDocument(
 			action = "replaced"
 		case "new_version":
 			delCtx, delSpan := tracer.Start(ctx, "qdrant.delete_point")
+			setKind(delSpan, kindRetriever)
 			err := deletePoint(delCtx, dup.ID)
 			endSpanWithErr(delSpan, err)
 			if err != nil {
@@ -452,6 +474,7 @@ func handleAddDocument(
 			attribute.String("qdrant.action", action),
 		),
 	)
+	setKind(upsertSpan, kindRetriever)
 	err = upsertPoint(upsertCtx, pointID, vector, payload)
 	endSpanWithErr(upsertSpan, err)
 	if err != nil {
