@@ -19,6 +19,8 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/trace"
 )
 
 // ============================================================================
@@ -191,19 +193,40 @@ func handleAddDocument(
 	params AddDocumentParams,
 ) (*mcp.CallToolResult, AddDocumentResult, error) {
 
+	// Root span for the whole tool invocation. All sub-operations
+	// (validate, dedup, sampling, qdrant) attach as child spans under this.
+	ctx, rootSpan := tracer.Start(ctx, "tool.add_document",
+		trace.WithAttributes(
+			attribute.String("mcp.tool.name", "add_document"),
+			attribute.Int("doc.text_length", len(params.Text)),
+			attribute.String("doc.source_url", params.SourceURL),
+		),
+	)
+	defer rootSpan.End()
+
 	text := params.Text
 	sourceURL := params.SourceURL
 
 	// --- STEP 0: L0 sanity — structural validation (empty, length, UTF-8, URL).
 	// Cheap, deterministic; ~µs cost. Fail fast before any network call.
-	if err := sanityCheckL0(text, sourceURL); err != nil {
-		return softErr("L0 sanity check failed: " + err.Error())
+	{
+		_, span := tracer.Start(ctx, "validate.L0")
+		l0err := sanityCheckL0(text, sourceURL)
+		endSpanWithErr(span, l0err)
+		if l0err != nil {
+			return softErr("L0 sanity check failed: " + l0err.Error())
+		}
 	}
 
 	// --- STEP 0.5: L1 sanity — lexical heuristics (token diversity, repetition,
 	// HTML/script injection patterns, placeholder blacklist). Still cheap, no network.
-	if err := sanityCheckL1(text); err != nil {
-		return softErr("L1 sanity check failed: " + err.Error())
+	{
+		_, span := tracer.Start(ctx, "validate.L1")
+		l1err := sanityCheckL1(text)
+		endSpanWithErr(span, l1err)
+		if l1err != nil {
+			return softErr("L1 sanity check failed: " + l1err.Error())
+		}
 	}
 
 	// Hash on TRIMMED text — so "foo" and "  foo  " collide on exact-dup check.
@@ -214,14 +237,25 @@ func handleAddDocument(
 
 	// --- STEP 1: Check collection existence (moved BEFORE embed so we can run
 	// L2 hash dedup against an existing collection and skip the embed cost).
-	exists, err := checkCollection(ctx)
+	checkCtx, checkSpan := tracer.Start(ctx, "qdrant.check_collection",
+		trace.WithAttributes(
+			attribute.String("db.system", "qdrant"),
+			attribute.String("db.collection.name", qdrantCollection),
+		),
+	)
+	exists, err := checkCollection(checkCtx)
+	checkSpan.SetAttributes(attribute.Bool("qdrant.collection.exists", exists))
+	endSpanWithErr(checkSpan, err)
 	if err != nil {
 		return nil, AddDocumentResult{}, fmt.Errorf("collection check failed: %w", err)
 	}
 
 	// --- STEP 1.5: Elicit bootstrap if missing
 	if !exists {
-		approved, err := elicitBootstrap(ctx, req)
+		elicitCtx, elicitSpan := tracer.Start(ctx, "elicit.bootstrap")
+		approved, err := elicitBootstrap(elicitCtx, req)
+		elicitSpan.SetAttributes(attribute.Bool("elicit.approved", approved))
+		endSpanWithErr(elicitSpan, err)
 		if err != nil {
 			return nil, AddDocumentResult{}, fmt.Errorf("elicit bootstrap failed: %w", err)
 		}
@@ -233,7 +267,15 @@ func handleAddDocument(
 				qdrantCollection,
 			))
 		}
-		if err := createCollection(ctx); err != nil {
+		createCtx, createSpan := tracer.Start(ctx, "qdrant.create_collection",
+			trace.WithAttributes(
+				attribute.String("db.system", "qdrant"),
+				attribute.String("db.collection.name", qdrantCollection),
+			),
+		)
+		err = createCollection(createCtx)
+		endSpanWithErr(createSpan, err)
+		if err != nil {
 			return nil, AddDocumentResult{}, fmt.Errorf("collection create failed: %w", err)
 		}
 	}
@@ -241,7 +283,15 @@ func handleAddDocument(
 	// --- STEP 2: L2 sanity — SHA-256 dedup BEFORE expensive embed.
 	// Skip lookup when we just created the collection (it's empty by definition).
 	if exists {
-		hit, err := dedupByHashL2(ctx, hashHex)
+		dedupCtx, dedupSpan := tracer.Start(ctx, "dedup.hash",
+			trace.WithAttributes(
+				attribute.String("db.system", "qdrant"),
+				attribute.String("hash.algorithm", "sha256"),
+			),
+		)
+		hit, err := dedupByHashL2(dedupCtx, hashHex)
+		dedupSpan.SetAttributes(attribute.Bool("dedup.hit", hit != nil))
+		endSpanWithErr(dedupSpan, err)
 		if err != nil {
 			return nil, AddDocumentResult{}, fmt.Errorf("L2 hash lookup failed: %w", err)
 		}
@@ -264,7 +314,18 @@ func handleAddDocument(
 				"and ENABLE_SAMPLING=true. Either connect with a sampling-capable client " +
 				"or set ENABLE_SAMPLING=false to bypass the LLM quality gate.")
 		}
-		accepted, reason, err := sampleVerdict(ctx, req.Session, text)
+		verdictCtx, verdictSpan := tracer.Start(ctx, "sampling.verdict",
+			trace.WithAttributes(
+				attribute.String("gen_ai.system", "mcp.sampling"),
+				attribute.String("gen_ai.operation.name", "verdict"),
+			),
+		)
+		accepted, reason, err := sampleVerdict(verdictCtx, req.Session, text)
+		verdictSpan.SetAttributes(
+			attribute.Bool("sampling.accepted", accepted),
+			attribute.String("sampling.reason", reason),
+		)
+		endSpanWithErr(verdictSpan, err)
 		if err != nil {
 			return nil, AddDocumentResult{}, fmt.Errorf("L5 verdict sampling failed: %w", err)
 		}
@@ -272,20 +333,53 @@ func handleAddDocument(
 			return softErr(fmt.Sprintf("L5 quality gate rejected: %s", reason))
 		}
 		// Verdict passed — extract metadata (fail-open).
-		meta, err = sampleMetadata(ctx, req.Session, text)
+		metaCtx, metaSpan := tracer.Start(ctx, "sampling.metadata",
+			trace.WithAttributes(
+				attribute.String("gen_ai.system", "mcp.sampling"),
+				attribute.String("gen_ai.operation.name", "extract_metadata"),
+			),
+		)
+		meta, err = sampleMetadata(metaCtx, req.Session, text)
+		if meta != nil {
+			metaSpan.SetAttributes(
+				attribute.String("doc.title", meta.Title),
+				attribute.Int("doc.tag_count", len(meta.Tags)),
+			)
+		}
+		endSpanWithErr(metaSpan, err)
 		if err != nil {
 			return nil, AddDocumentResult{}, fmt.Errorf("L5 metadata sampling failed: %w", err)
 		}
 	}
 
 	// --- STEP 3: Embed text via Ollama (OpenAI-compatible embeddings endpoint)
-	vector, err := embedText(ctx, text)
+	embedCtx, embedSpan := tracer.Start(ctx, "embed.ollama",
+		trace.WithAttributes(
+			attribute.String("gen_ai.system", "ollama"),
+			attribute.String("gen_ai.operation.name", "embeddings"),
+			attribute.String("gen_ai.request.model", ollamaModel),
+		),
+	)
+	vector, err := embedText(embedCtx, text)
+	embedSpan.SetAttributes(attribute.Int("embedding.dimension", len(vector)))
+	endSpanWithErr(embedSpan, err)
 	if err != nil {
 		return nil, AddDocumentResult{}, fmt.Errorf("embed failed: %w", err)
 	}
 
 	// --- STEP 4: Duplicate detection — cosine similarity search (paraphrase-aware)
-	dup, err := searchSimilar(ctx, vector)
+	searchCtx, searchSpan := tracer.Start(ctx, "dedup.cosine",
+		trace.WithAttributes(
+			attribute.String("db.system", "qdrant"),
+			attribute.String("db.operation", "search"),
+		),
+	)
+	dup, err := searchSimilar(searchCtx, vector)
+	searchSpan.SetAttributes(attribute.Bool("dedup.hit", dup != nil))
+	if dup != nil {
+		searchSpan.SetAttributes(attribute.Float64("dedup.score", float64(dup.Score)))
+	}
+	endSpanWithErr(searchSpan, err)
 	if err != nil {
 		return nil, AddDocumentResult{}, fmt.Errorf("search failed: %w", err)
 	}
@@ -295,7 +389,10 @@ func handleAddDocument(
 
 	// --- STEP 4.5: Elicit dup-handling if a cosine match was found
 	if dup != nil {
-		choice, err := elicitDupAction(ctx, req, dup)
+		dupElicitCtx, dupElicitSpan := tracer.Start(ctx, "elicit.dup_action")
+		choice, err := elicitDupAction(dupElicitCtx, req, dup)
+		dupElicitSpan.SetAttributes(attribute.String("elicit.choice", choice))
+		endSpanWithErr(dupElicitSpan, err)
 		if err != nil {
 			return nil, AddDocumentResult{}, fmt.Errorf("elicit dup action failed: %w", err)
 		}
@@ -303,12 +400,18 @@ func handleAddDocument(
 		case "decline", "":
 			return softErr("Duplicate detected; user declined insertion.")
 		case "replace":
-			if err := deletePoint(ctx, dup.ID); err != nil {
+			delCtx, delSpan := tracer.Start(ctx, "qdrant.delete_point")
+			err := deletePoint(delCtx, dup.ID)
+			endSpanWithErr(delSpan, err)
+			if err != nil {
 				return nil, AddDocumentResult{}, fmt.Errorf("delete old point: %w", err)
 			}
 			action = "replaced"
 		case "new_version":
-			if err := deletePoint(ctx, dup.ID); err != nil {
+			delCtx, delSpan := tracer.Start(ctx, "qdrant.delete_point")
+			err := deletePoint(delCtx, dup.ID)
+			endSpanWithErr(delSpan, err)
+			if err != nil {
 				return nil, AddDocumentResult{}, fmt.Errorf("delete old point: %w", err)
 			}
 			action = "versioned"
@@ -340,7 +443,18 @@ func handleAddDocument(
 			payload["summary"] = meta.Summary
 		}
 	}
-	if err := upsertPoint(ctx, pointID, vector, payload); err != nil {
+	upsertCtx, upsertSpan := tracer.Start(ctx, "qdrant.upsert",
+		trace.WithAttributes(
+			attribute.String("db.system", "qdrant"),
+			attribute.String("db.operation", "upsert"),
+			attribute.String("db.collection.name", qdrantCollection),
+			attribute.String("qdrant.point.id", pointID),
+			attribute.String("qdrant.action", action),
+		),
+	)
+	err = upsertPoint(upsertCtx, pointID, vector, payload)
+	endSpanWithErr(upsertSpan, err)
+	if err != nil {
 		return nil, AddDocumentResult{}, fmt.Errorf("upsert failed: %w", err)
 	}
 

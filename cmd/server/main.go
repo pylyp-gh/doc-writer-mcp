@@ -10,7 +10,6 @@ import (
 
 	"github.com/pylyp-gh/doc-writer-mcp/internal/tools"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
-	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 var (
@@ -44,18 +43,16 @@ func run() error {
 	// Register tools
 	tools.AddToolsToServer(server)
 
-	// Start server with appropriate transport
+	// Start server with appropriate transport. Tracing instrumentation
+	// lives у the tool handlers themselves (semantic spans per
+	// validate/sampling/qdrant operation) — HTTP-level otelhttp wrap
+	// was dropped because per-request DELETE 204 session-teardown +
+	// healthcheck noise drowned the actual LLM operation signal у Phoenix.
 	if *httpAddr != "" {
-		mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
+		handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
 			return server
 		}, nil)
-		// Wrap з otelhttp — creates one server-side span per HTTP request,
-		// extracting W3C trace context з incoming headers so upstream
-		// agentgateway / agent-runtime spans link as parents.
-		handler := otelhttp.NewHandler(mcpHandler, "mcp.http",
-			otelhttp.WithMessageEvents(otelhttp.ReadEvents, otelhttp.WriteEvents),
-		)
-		log.Printf("MCP server listening at %s (otelhttp wrapped)", *httpAddr)
+		log.Printf("MCP server listening at %s", *httpAddr)
 		return http.ListenAndServe(*httpAddr, handler)
 	} else {
 		// v1.6.0: NewStdioTransport / NewLoggingTransport functions removed —
