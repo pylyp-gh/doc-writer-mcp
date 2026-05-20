@@ -10,6 +10,7 @@ import (
 
 	"github.com/pylyp-gh/doc-writer-mcp/internal/tools"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 )
 
 var (
@@ -26,6 +27,17 @@ func main() {
 }
 
 func run() error {
+	// Initialize OTel tracing (no-op when OTEL_EXPORTER_OTLP_ENDPOINT unset).
+	ctx := context.Background()
+	shutdownTracer, err := initTracing(ctx)
+	if err != nil {
+		log.Printf("WARN: tracing init failed (%v) — continuing without telemetry", err)
+		shutdownTracer = func(context.Context) error { return nil }
+	}
+	defer func() {
+		_ = shutdownTracer(context.Background())
+	}()
+
 	// Create the MCP server
 	server := mcp.NewServer(&mcp.Implementation{Name: "doc-writer-mcp", Version: "0.1.0"}, nil)
 
@@ -34,10 +46,16 @@ func run() error {
 
 	// Start server with appropriate transport
 	if *httpAddr != "" {
-		handler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
+		mcpHandler := mcp.NewStreamableHTTPHandler(func(*http.Request) *mcp.Server {
 			return server
 		}, nil)
-		log.Printf("MCP server listening at %s", *httpAddr)
+		// Wrap з otelhttp — creates one server-side span per HTTP request,
+		// extracting W3C trace context з incoming headers so upstream
+		// agentgateway / agent-runtime spans link as parents.
+		handler := otelhttp.NewHandler(mcpHandler, "mcp.http",
+			otelhttp.WithMessageEvents(otelhttp.ReadEvents, otelhttp.WriteEvents),
+		)
+		log.Printf("MCP server listening at %s (otelhttp wrapped)", *httpAddr)
 		return http.ListenAndServe(*httpAddr, handler)
 	} else {
 		// v1.6.0: NewStdioTransport / NewLoggingTransport functions removed —
